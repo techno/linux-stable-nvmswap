@@ -68,7 +68,7 @@ static int r_cnt = 0;
 static int w_time = 0;
 static int w_timep = 0;
 static int r_time = 0;
-static int mem_swap_index;
+static int mem_swap_index = -1;
 static struct page *test_page;
 static struct swap_info_struct *sp;
 static int cnt = 0;
@@ -2574,7 +2574,9 @@ unsigned long setup_mem_swap_header(struct swap_info_struct *p, struct zone *zon
 	else
 		printk(KERN_INFO "MemSwap: swap size = %lu pages\n", zonepages);
 
-	start_pfn = zone->zone_start_pfn;
+	/* start_pfn = zone->zone_start_pfn; */
+	/* FIXME: force skip ZONE_DMA area */
+	start_pfn = zone->zone_start_pfn + ((16 * 1024 * 1024) >> PAGE_SHIFT);
 	p->start_pfn = start_pfn;
 	header_page = pfn_to_page(start_pfn);
 
@@ -2612,8 +2614,6 @@ int mem_swap_free_list_init(struct swap_info_struct *p)
 	unsigned long pfn, pre;
 	unsigned long *addr = NULL;
 	int size = PAGE_SIZE / sizeof(unsigned long);
-
-
 
 	/* find the first valid pfn */
 	for (pfn = start + 1; pfn < end; pfn++) {

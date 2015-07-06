@@ -417,8 +417,9 @@ void __init zone_sizes_init(void)
 	//unsigned long mem_swap_size = 0;
 	//unsigned long normal_start = min, normal_end = max_low_pfn - mem_swap_size;
 	printk(KERN_INFO "begin to initialze zones...\n");
-	printk(KERN_INFO "normal_pfns = %ld, memswap_pfns = %ld\n",
-	       max_low_pfn - MEMSWAP_ZONE_SIZE_PFN, max_low_pfn);
+	printk(KERN_INFO "DMA32_pfns = %ld, memswap_pfns = %ld\n",
+	       MAX_DMA32_PFN - (MAX_DMA_PFN + MEMSWAP_ZONE_SIZE_PFN),
+	       MAX_DMA_PFN + MEMSWAP_ZONE_SIZE_PFN);
 #endif
 
 	memset(max_zone_pfns, 0, sizeof(max_zone_pfns));
@@ -428,6 +429,7 @@ void __init zone_sizes_init(void)
 #endif
 
 #ifdef CONFIG_ZONE_MEMSWAP
+	/* FIXME: Consider DMA Zone */
 	max_zone_pfns[ZONE_MEMSWAP]	= MAX_DMA_PFN + MEMSWAP_ZONE_SIZE_PFN;
 #endif
 

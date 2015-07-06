@@ -58,7 +58,6 @@
 #include <linux/elf.h>
 #include <linux/gfp.h>
 #include <linux/syscalls.h>
-#include <linux/bootmem.h>	/* for max_low_pfn */
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -3634,17 +3633,14 @@ int handle_pte_fault(struct mm_struct *mm,
 	if (flags & FAULT_FLAG_WRITE) {
 		if (!pte_write(entry)) {
 #ifdef CONFIG_MEMSWAP
-			if (pte_mem_swap(entry)) {
+			if (pte_mem_swap(entry) && mem_swap_type() >= 0) {
 				/*
 				 * nvm-swap:
 				 * swap zone page write protection fault
 				 */
-				/*unsigned long offset =
-					((unsigned long)pte_val(entry) >> PAGE_SHIFT)
-					- mem_swap_start_pfn();*/
 				unsigned long offset =
 					((unsigned long)pte_val(entry) >> PAGE_SHIFT)
-					- (max_low_pfn - MEMSWAP_ZONE_SIZE_PFN);
+					- mem_swap_start_pfn();
 
 				MEMSWAP_DEBUG(KERN_INFO "NVM-SWAP PAGE FAULT PTE %x %x\n", native_pte_val(entry), offset);
 
