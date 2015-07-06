@@ -137,6 +137,11 @@ static inline unsigned long pte_pfn(pte_t pte)
 	return (pte_val(pte) & PTE_PFN_MASK) >> PAGE_SHIFT;
 }
 
+static inline unsigned long pte_mem_swap(pte_t pte)
+{
+	return (pte_val(pte) & _PAGE_MEMSWAP);
+}
+
 static inline unsigned long pmd_pfn(pmd_t pmd)
 {
 	return (pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT;

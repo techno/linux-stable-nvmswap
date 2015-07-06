@@ -166,6 +166,9 @@ int sysctl_lowmem_reserve_ratio[MAX_NR_ZONES-1] = {
 #ifdef CONFIG_ZONE_DMA
 	 256,
 #endif
+#ifdef CONFIG_ZONE_MEMSWAP
+	 256,
+#endif
 #ifdef CONFIG_ZONE_DMA32
 	 256,
 #endif
@@ -180,6 +183,9 @@ EXPORT_SYMBOL(totalram_pages);
 static char * const zone_names[MAX_NR_ZONES] = {
 #ifdef CONFIG_ZONE_DMA
 	 "DMA",
+#endif
+#ifdef CONFIG_ZONE_MEMSWAP
+	 "MemSwap",
 #endif
 #ifdef CONFIG_ZONE_DMA32
 	 "DMA32",
@@ -1749,6 +1755,11 @@ get_page_from_freelist(gfp_t gfp_mask, nodemask_t *nodemask, unsigned int order,
 	int did_zlc_setup = 0;		/* just call zlc_setup() one time */
 
 	classzone_idx = zone_idx(preferred_zone);
+
+	if (gfp_mask & GFP_MEMSWAP) {
+		zone = preferred_zone;
+		goto try_this_zone;
+	}
 zonelist_scan:
 	/*
 	 * Scan zonelist, looking for a zone with enough free.
@@ -1756,6 +1767,11 @@ zonelist_scan:
 	 */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
 						high_zoneidx, nodemask) {
+#ifdef CONFIG_MEMSWAP
+		if (zone_idx(zone) == ZONE_MEMSWAP)
+			continue;
+#endif
+
 		if (NUMA_BUILD && zlc_active &&
 			!zlc_zone_worth_trying(zonelist, z, allowednodes))
 				continue;
@@ -1846,6 +1862,8 @@ try_this_zone:
 		if (page)
 			break;
 this_zone_full:
+		if (gfp_mask & GFP_MEMSWAP)
+			return NULL;
 		if (NUMA_BUILD)
 			zlc_mark_zone_full(zonelist, z);
 	}
@@ -2427,6 +2445,25 @@ got_pg:
 }
 
 /*
+ * nvm-swap
+ */
+static struct zone * get_memswap_zone(struct zonelist *zonelist)
+{
+#ifdef CONFIG_MEMSWAP
+	struct zoneref *z = zonelist->_zonerefs;
+	int i;
+
+	for (i = 0; i < MAX_ZONES_PER_ZONELIST; i++) {
+		if (zonelist_zone_idx(z) == ZONE_MEMSWAP)
+			return z->zone;
+		z++;
+	}
+#endif
+
+	return NULL;
+}
+
+/*
  * This is the 'heart' of the zoned buddy allocator.
  */
 struct page *
@@ -2463,6 +2500,11 @@ retry_cpuset:
 	first_zones_zonelist(zonelist, high_zoneidx,
 				nodemask ? : &cpuset_current_mems_allowed,
 				&preferred_zone);
+
+	if (gfp_mask & GFP_MEMSWAP) {
+		preferred_zone = get_memswap_zone(zonelist);
+	}
+
 	if (!preferred_zone)
 		goto out;
 
@@ -4333,6 +4375,16 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 		 */
 		memmap_pages =
 			PAGE_ALIGN(size * sizeof(struct page)) >> PAGE_SHIFT;
+
+#ifdef CONFIG_MEMSWAP_NO
+		/* nvm-swap */
+		/*　DANGER: THIS DEBUG PRINT CAUSE NULL REFERENCE
+		printk(KERN_INFO
+		       "  %s zone: size = %lu, realsize = %lu, hole_size = %lu, mem_mappages = %lu\n",
+		       zone_names[j], size, realsize, zholes_size[ZONE_MEMSWAP], memmap_pages);
+		*/
+#endif
+
 		if (realsize >= memmap_pages) {
 			realsize -= memmap_pages;
 			if (memmap_pages)
@@ -4359,8 +4411,7 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 		zone->present_pages = realsize;
 #ifdef CONFIG_NUMA
 		zone->node = nid;
-		zone->min_unmapped_pages = (realsize*sysctl_min_unmapped_ratio)
-						/ 100;
+		zone->min_unmapped_pages = (realsize*sysctl_min_unmapped_ratio) / 100;
 		zone->min_slab_pages = (realsize * sysctl_min_slab_ratio) / 100;
 #endif
 		zone->name = zone_names[j];

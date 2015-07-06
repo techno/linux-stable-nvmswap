@@ -19,6 +19,32 @@
 #include <linux/swapops.h>
 #include <linux/writeback.h>
 #include <asm/pgtable.h>
+#include <linux/swap.h>
+#include <linux/syscalls.h>
+
+/*
+ * nvm-swap: swap count information system-calls
+ */
+static int swap_outs = 0;
+static int swap_ins = 0;
+SYSCALL_DEFINE0(reset_swap_outs)
+{
+	swap_outs = 0;
+	swap_ins = 0;
+	return 0;
+}
+SYSCALL_DEFINE0(print_swap_outs)
+{
+	/*
+	printk(KERN_ERR "[SWAP] swap-outs = %d, swap-ins = %d\n",
+			swap_outs, swap_ins);
+	*/
+	return swap_outs;
+}
+SYSCALL_DEFINE0(print_swap_ins)
+{
+	return swap_ins;
+}
 
 static struct bio *get_swap_bio(gfp_t gfp_flags,
 				struct page *page, bio_end_io_t end_io)
@@ -85,6 +111,34 @@ void end_swap_bio_read(struct bio *bio, int err)
 	bio_put(bio);
 }
 
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+void mem_swap_writepage(struct page *page, struct swap_info_struct *si)
+{
+    swp_entry_t entry;
+    pgoff_t offset, old;
+    unsigned long pfn;
+    void *pg_addr, *swp_addr;
+
+    entry.val = page_private(page);
+    old = swp_offset(entry);
+    offset = si->slot_map[old];
+
+    pfn = offset + si->start_pfn;
+    swp_addr = __va(pfn << PAGE_SHIFT);
+    pg_addr = kmap_atomic(page);
+
+    memcpy(swp_addr, pg_addr, PAGE_SIZE);
+
+    si->slot_age[offset]++;
+    min_heapify(si->heap, si->index, si->max, si->index[offset]);
+
+    kunmap_atomic(pg_addr);
+}
+#endif
+
 /*
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
@@ -93,11 +147,26 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 {
 	struct bio *bio;
 	int ret = 0, rw = WRITE;
+	struct swap_info_struct *si;
 
 	if (try_to_free_swap(page)) {
 		unlock_page(page);
 		goto out;
 	}
+
+#ifdef CONFIG_MEMSWAP
+	/* nvm-swap: do memory swap */
+	si = mem_swap_page2info(page);
+	if (si->flags & SWP_MEM) {
+		count_vm_event(PSWPOUT);
+		set_page_writeback(page);
+		unlock_page(page);
+		mem_swap_writepage(page, si);
+		end_page_writeback(page);
+		goto out;
+	}
+#endif
+
 	bio = get_swap_bio(GFP_NOIO, page, end_swap_bio_write);
 	if (bio == NULL) {
 		set_page_dirty(page);
@@ -108,6 +177,7 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		rw |= REQ_SYNC;
 	count_vm_event(PSWPOUT);
+	swap_outs++;
 	set_page_writeback(page);
 	unlock_page(page);
 	submit_bio(rw, bio);
@@ -115,13 +185,51 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+void mem_swap_readpage(struct page *page, struct swap_info_struct *si)
+{
+	swp_entry_t entry;
+	pgoff_t offset;
+	unsigned long pfn;
+	void *pg_addr, *swp_addr;
+
+	entry.val = page_private(page);
+	offset = swp_offset(entry);
+	offset = si->slot_map[offset];
+
+	pfn = offset + si->start_pfn;
+	swp_addr = __va(pfn << PAGE_SHIFT);
+	pg_addr = kmap_atomic(page);
+
+	memcpy(pg_addr, swp_addr, PAGE_SIZE);
+
+	kunmap_atomic(pg_addr);
+}
+#endif
+
 int swap_readpage(struct page *page)
 {
 	struct bio *bio;
 	int ret = 0;
+	struct swap_info_struct *si;
 
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(PageUptodate(page));
+
+#ifdef CONFIG_MEMSWAP
+	si = mem_swap_page2info(page);
+	if (si->flags & SWP_MEM) {
+		count_vm_event(PSWPIN);
+		mem_swap_readpage(page, si);
+		unlock_page(page);
+		SetPageUptodate(page);
+		goto out;
+	}
+#endif
+
 	bio = get_swap_bio(GFP_KERNEL, page, end_swap_bio_read);
 	if (bio == NULL) {
 		unlock_page(page);
@@ -129,6 +237,7 @@ int swap_readpage(struct page *page)
 		goto out;
 	}
 	count_vm_event(PSWPIN);
+	swap_ins++;
 	submit_bio(READ, bio);
 out:
 	return ret;

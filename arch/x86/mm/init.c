@@ -1,3 +1,4 @@
+#include <linux/mm.h>
 #include <linux/gfp.h>
 #include <linux/initrd.h>
 #include <linux/ioport.h>
@@ -412,15 +413,28 @@ void __init zone_sizes_init(void)
 {
 	unsigned long max_zone_pfns[MAX_NR_ZONES];
 
+#ifdef CONFIG_ZONE_MEMSWAP
+	//unsigned long mem_swap_size = 0;
+	//unsigned long normal_start = min, normal_end = max_low_pfn - mem_swap_size;
+	printk(KERN_INFO "begin to initialze zones...\n");
+	printk(KERN_INFO "normal_pfns = %ld, memswap_pfns = %ld\n",
+	       max_low_pfn - MEMSWAP_ZONE_SIZE_PFN, max_low_pfn);
+#endif
+
 	memset(max_zone_pfns, 0, sizeof(max_zone_pfns));
 
 #ifdef CONFIG_ZONE_DMA
 	max_zone_pfns[ZONE_DMA]		= MAX_DMA_PFN;
 #endif
+
+#ifdef CONFIG_ZONE_MEMSWAP
+	max_zone_pfns[ZONE_MEMSWAP]	= MAX_DMA_PFN + MEMSWAP_ZONE_SIZE_PFN;
+#endif
+
 #ifdef CONFIG_ZONE_DMA32
 	max_zone_pfns[ZONE_DMA32]	= MAX_DMA32_PFN;
 #endif
-	max_zone_pfns[ZONE_NORMAL]	= max_low_pfn;
+	max_zone_pfns[ZONE_NORMAL]      = max_low_pfn;
 #ifdef CONFIG_HIGHMEM
 	max_zone_pfns[ZONE_HIGHMEM]	= max_pfn;
 #endif

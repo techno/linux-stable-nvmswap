@@ -7,6 +7,9 @@
 
 typedef struct page *new_page_t(struct page *, unsigned long private, int **);
 
+/* nvm-swap */
+extern int migrate_code_pages(struct list_head *l, new_page_t x);
+
 #ifdef CONFIG_MIGRATION
 
 extern void putback_lru_pages(struct list_head *l);

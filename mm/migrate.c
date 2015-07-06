@@ -40,6 +40,23 @@
 #include "internal.h"
 
 /*
+ * nvm-swap
+ */
+static int swap_outs = 0;
+
+SYSCALL_DEFINE0(reset_migration_count)
+{
+	swap_outs = 0;
+	return 0;
+}
+
+SYSCALL_DEFINE0(print_migration_count)
+{
+	//printk(KERN_ERR "[MIGRATION] migration count = %d", swap_outs);
+	return swap_outs;
+}
+
+/*
  * migrate_prep() needs to be called before we start compiling a list of pages
  * to be migrated using isolate_lru_page(). If scheduling work on other CPUs is
  * undesirable, use migrate_prep_local()
@@ -427,6 +444,10 @@ void migrate_page_copy(struct page *newpage, struct page *page)
 	else
 		copy_highpage(newpage, page);
 
+#ifdef CONFIG_ZONE_MEMSWAP
+	if(PageSwapMem(newpage))
+		swap_outs++;
+#endif
 	if (PageError(page))
 		SetPageError(newpage);
 	if (PageReferenced(page))

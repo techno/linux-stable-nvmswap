@@ -19,6 +19,9 @@
 #include <linux/atomic.h>
 #include <asm/page.h>
 
+/* nvm-swap area: 2GB */
+#define MEMSWAP_ZONE_SIZE_PFN ((2UL * 1024 * 1024 * 1024) >> PAGE_SHIFT)
+
 /* Free memory management - zoned buddy allocator.  */
 #ifndef CONFIG_FORCE_MAX_ZONEORDER
 #define MAX_ORDER 11
@@ -237,6 +240,12 @@ enum zone_type {
 	 * 			<16M.
 	 */
 	ZONE_DMA,
+#endif
+#ifdef CONFIG_ZONE_MEMSWAP
+	/*
+	 * nvm-swap
+	 */
+	ZONE_MEMSWAP,
 #endif
 #ifdef CONFIG_ZONE_DMA32
 	/*
@@ -748,6 +757,18 @@ static inline int is_highmem_idx(enum zone_type idx)
 #endif
 }
 
+/*
+ * nvm-swap
+ */
+static inline int is_swapmem_idx(enum zone_type idx)
+{
+#ifdef CONFIG_MEMSWAP
+	return (idx == ZONE_MEMSWAP);
+#else
+	return 0;
+#endif
+}
+
 static inline int is_normal_idx(enum zone_type idx)
 {
 	return (idx == ZONE_NORMAL);
@@ -766,6 +787,18 @@ static inline int is_highmem(struct zone *zone)
 	return zone_off == ZONE_HIGHMEM * sizeof(*zone) ||
 	       (zone_off == ZONE_MOVABLE * sizeof(*zone) &&
 		zone_movable_is_highmem());
+#else
+	return 0;
+#endif
+}
+
+/*
+ * nvm-swap
+ */
+static inline int is_swapmem(struct zone *zone)
+{
+#ifdef CONFIG_MEMSWAP
+	return zone == zone->zone_pgdat->node_zones + ZONE_MEMSWAP;
 #else
 	return 0;
 #endif

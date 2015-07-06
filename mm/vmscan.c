@@ -788,6 +788,11 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		cond_resched();
 
 		page = lru_to_page(page_list);
+
+#ifdef CONFIG_ZONE_MEMSWAP
+		if (PageSwapMem(page))
+			continue;
+#endif
 		list_del(&page->lru);
 
 		if (!trylock_page(page))
@@ -2142,6 +2147,11 @@ static void shrink_zone(int priority, struct zone *zone,
 		.priority = priority,
 	};
 	struct mem_cgroup *memcg;
+
+#ifdef CONFIG_MEMSWAP
+	if (zone_idx(zone) == ZONE_MEMSWAP)
+		return;
+#endif
 
 	memcg = mem_cgroup_iter(root, NULL, &reclaim);
 	do {

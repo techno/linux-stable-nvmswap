@@ -318,6 +318,26 @@
 309	common	getcpu			sys_getcpu
 310	64	process_vm_readv	sys_process_vm_readv
 311	64	process_vm_writev	sys_process_vm_writev
+
+#
+# nvm-swap syscalls
+#
+400	common	swap_write		sys_swap_write
+401	common	swap_read		sys_swap_read
+402	common	swap_free		sys_swap_free
+403	common	test_start		sys_test_start
+404	common	test_end		sys_test_end
+405	common	direct_read_start	sys_direct_read_start
+406	common	direct_read_end		sys_direct_read_end
+407	common	reset_migration_count	sys_reset_migration_count
+408	common	print_migration_count	sys_print_migration_count
+409	common	reset_swap_outs		sys_reset_swap_outs
+410	common	print_swap_outs		sys_print_swap_outs
+410	common	print_mi_queue		sys_print_mi_queue
+410	common	print_swap_ins		sys_print_swap_ins
+410	common	clear_fault		sys_clear_fault
+410	common	get_fault		sys_get_fault
+
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
 # for native 64-bit operation.

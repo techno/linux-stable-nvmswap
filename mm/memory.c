@@ -57,6 +57,8 @@
 #include <linux/swapops.h>
 #include <linux/elf.h>
 #include <linux/gfp.h>
+#include <linux/syscalls.h>
+#include <linux/bootmem.h>	/* for max_low_pfn */
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -66,6 +68,12 @@
 #include <asm/pgtable.h>
 
 #include "internal.h"
+
+#ifdef CONFIG_MEMSWAP_DEBUG
+#define MEMSWAP_DEBUG printk
+#else
+#define MEMSWAP_DEBUG(...)
+#endif
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES
 /* use the per-pgdat data instead for discontigmem - mbligh */
@@ -88,6 +96,39 @@ void * high_memory;
 
 EXPORT_SYMBOL(num_physpages);
 EXPORT_SYMBOL(high_memory);
+
+/*
+ * nvm-swap: A number of access, write, page-fault.
+ */
+int num_access = 0;
+int num_write = 0;
+int num_page_fault = 0;
+
+SYSCALL_DEFINE0(direct_read_start)
+{
+	num_access = 0;
+	num_write = 0;
+	return 0;
+}
+
+SYSCALL_DEFINE0(clear_fault)
+{
+	num_page_fault = 0;
+	return 0;
+}
+
+SYSCALL_DEFINE0(get_fault)
+{
+	return num_page_fault;
+}
+
+SYSCALL_DEFINE0(direct_read_end)
+{
+	printk(KERN_INFO "Total access count = %d\n", num_access);
+	printk(KERN_INFO "\t direct read count = %d, write count = %d\n",
+	       num_access - num_write, num_write);
+	return 0;
+}
 
 /*
  * Randomize the address space (stacks, mmaps, brk, etc.).
@@ -1122,6 +1163,39 @@ again:
 			struct page *page;
 
 			page = vm_normal_page(vma, addr, ptent);
+
+#ifdef CONFIG_MEMSWAP
+			if (is_mem_swap_page(page)) {
+				/*
+				 * nvm-swap
+				 */
+				ptent = ptep_get_and_clear_full(mm, addr, pte,
+								tlb->fullmm);
+				tlb_remove_tlb_entry(tlb, pte, addr);
+
+				if (unlikely(!page))
+					continue;
+				if(PageAnon(page))
+					rss[MM_ANONPAGES]--;
+				else {
+					if (pte_dirty(ptent))
+						set_page_dirty(page);
+					if (pte_young(ptent) &&
+					    likely(!VM_SequentialReadHint(vma)))
+						mark_page_accessed(page);
+					rss[MM_FILEPAGES]--;
+				}
+				page_remove_rmap(page);
+
+				if(page_mapcount(page) == 0) {
+					printk(KERN_ERR "try to free a mem swap page");
+					free_mem_swap_page(page);
+					printk("free ok\n");
+				}
+				continue;
+			}
+#endif
+
 			if (unlikely(details) && page) {
 				/*
 				 * unmap_shared_mapping_pages() wants to
@@ -2958,6 +3032,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	struct mem_cgroup *ptr;
 	int exclusive = 0;
 	int ret = 0;
+	struct swap_info_struct *si;
+	unsigned long offset;
 
 	if (!pte_unmap_same(mm, pmd, page_table, orig_pte))
 		goto out;
@@ -2978,6 +3054,46 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	page = lookup_swap_cache(entry);
 	if (!page) {
 		grab_swap_token(mm); /* Contend for token _before_ read-in */
+
+#ifdef CONFIG_MEMSWAP
+		si = mem_swap_entry2info(entry);
+		if ((si->flags & SWP_MEM) && !(flags & FAULT_FLAG_MEMSWAP_WRITE) &&
+                    !(flags & FAULT_FLAG_WRITE)) {
+			/*
+			 * nvm-swap:
+			 * the requested page is in swap area, we proposed the
+			 * direct-read method to read the page from swap area
+			 * directly, thus, we need to setup the pte entry for
+			 * that address
+			 */
+			offset = swp_offset(entry);
+			offset = si->slot_map[offset];
+			page = pfn_to_page(si->start_pfn + offset);
+			MEMSWAP_DEBUG(KERN_INFO "MemSwap: in do_swap_page, offset = %lu, addr = %lx\n",
+				      offset, (unsigned long)address);
+
+			lock_page_or_retry(page, mm, flags);
+			delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
+
+			pte = mk_pte(page, __pgprot(vma->vm_page_prot.pgprot | _PAGE_MEMSWAP));
+			page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+			flush_icache_page(vma, page);
+			set_pte_at(mm, address, page_table, pte);
+
+			do_page_add_anon_rmap(page, vma, address, exclusive);
+			/* It's better to call commit-charge after rmap is established */
+			mem_cgroup_commit_charge_swapin(page, ptr);
+
+			unlock_page(page);
+
+			update_mmu_cache(vma, address, page_table);
+			pte_unmap_unlock(page_table, ptl);
+
+			ret = VM_FAULT_MINOR;
+			goto out;
+		}
+#endif
+
 		page = swapin_readahead(entry,
 					GFP_HIGHUSER_MOVABLE, vma, address);
 		if (!page) {
@@ -3043,7 +3159,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * Back out if somebody else already faulted in this pte.
 	 */
 	page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
-	if (unlikely(!pte_same(*page_table, orig_pte)))
+	if (unlikely(!pte_same(*page_table, orig_pte)) &&
+	    unlikely(!(flags & FAULT_FLAG_MEMSWAP_WRITE)))
 		goto out_nomap;
 
 	if (unlikely(!PageUptodate(page))) {
@@ -3487,6 +3604,11 @@ int handle_pte_fault(struct mm_struct *mm,
 	pte_t entry;
 	spinlock_t *ptl;
 
+	/* nvm-swap */
+	struct swap_info_struct *si;
+	int res = 0;
+	swp_entry_t swp;
+
 	entry = *pte;
 	if (!pte_present(entry)) {
 		if (pte_none(entry)) {
@@ -3510,9 +3632,45 @@ int handle_pte_fault(struct mm_struct *mm,
 	if (unlikely(!pte_same(*pte, entry)))
 		goto unlock;
 	if (flags & FAULT_FLAG_WRITE) {
-		if (!pte_write(entry))
+		if (!pte_write(entry)) {
+#ifdef CONFIG_MEMSWAP
+			if (pte_mem_swap(entry)) {
+				/*
+				 * nvm-swap:
+				 * swap zone page write protection fault
+				 */
+				/*unsigned long offset =
+					((unsigned long)pte_val(entry) >> PAGE_SHIFT)
+					- mem_swap_start_pfn();*/
+				unsigned long offset =
+					((unsigned long)pte_val(entry) >> PAGE_SHIFT)
+					- (max_low_pfn - MEMSWAP_ZONE_SIZE_PFN);
+
+				MEMSWAP_DEBUG(KERN_INFO "NVM-SWAP PAGE FAULT PTE %x %x\n", native_pte_val(entry), offset);
+
+				if (offset < MEMSWAP_ZONE_SIZE_PFN) {
+					si = mem_swap_type2info(mem_swap_type());
+					offset = si->whoami[offset];
+					swp = swp_entry(mem_swap_type(), offset);
+
+					flags |= FAULT_FLAG_MEMSWAP_WRITE;
+					entry = swp_entry_to_pte(swp);
+
+					res = do_swap_page(mm, vma, address,
+							   pte, pmd, flags, entry);
+
+					spin_unlock(ptl);
+
+					//res |= FAULT_FLAG_DEBUG;
+					return res;
+				}
+
+				MEMSWAP_DEBUG(KERN_INFO "!NO MEM SWAP\n");
+			}
+#endif
 			return do_wp_page(mm, vma, address,
 					pte, pmd, ptl, entry);
+		}
 		entry = pte_mkdirty(entry);
 	}
 	entry = pte_mkyoung(entry);

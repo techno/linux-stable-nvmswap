@@ -20,9 +20,15 @@ struct bio;
 #define SWAP_FLAG_PRIO_MASK	0x7fff
 #define SWAP_FLAG_PRIO_SHIFT	0
 #define SWAP_FLAG_DISCARD	0x10000 /* discard swap cluster after use */
+#define SWAP_FLAG_MEM_SWAP      0x20000
 
+#ifdef CONFIG_MEMSWAP
+#define SWAP_FLAGS_VALID	(SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | \
+				 SWAP_FLAG_DISCARD | SWAP_FLAG_MEM_SWAP)
+#else
 #define SWAP_FLAGS_VALID	(SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | \
 				 SWAP_FLAG_DISCARD)
+#endif
 
 static inline int current_is_kswapd(void)
 {
@@ -38,6 +44,10 @@ static inline int current_is_kswapd(void)
  * the type/offset into the pte as 5/27 as well.
  */
 #define MAX_SWAPFILES_SHIFT	5
+
+/* nvm-swap */
+#define MAX_SWAP_SLOT_SHIFT 16
+#define MAX_SWAP_SLOT (1 << MAX_SWAP_SLOT_SHIFT)
 
 /*
  * Use some of the swap files numbers for other purposes. This
@@ -152,6 +162,9 @@ enum {
 	SWP_CONTINUED	= (1 << 5),	/* swap_map has count continuation */
 	SWP_BLKDEV	= (1 << 6),	/* its a block device */
 					/* add others here before... */
+#ifdef CONFIG_MEMSWAP
+	SWP_MEM         = (1 << 7),     /* is nvm-swap page? */
+#endif
 	SWP_SCANNING	= (1 << 8),	/* refcount in scan_swap_map */
 };
 
@@ -174,6 +187,29 @@ enum {
 #define COUNT_CONTINUED	0x80	/* See swap_map continuation for full count */
 #define SWAP_MAP_SHMEM	0xbf	/* Owned by shmem/tmpfs, in first swap_map */
 
+struct swap_slot_age_struct {
+	unsigned int offset;
+	unsigned int *age;
+};
+
+struct trie_struct {
+	int num;
+	int subnum;
+	struct trie_struct *next[10];
+};
+
+struct list_node_struct {
+	unsigned offset;
+	struct list_node_struct *next;
+};
+typedef struct list_node_struct list_node_t;
+
+struct list_struct
+{
+	list_node_t *head;
+	list_node_t *tail;
+};
+
 /*
  * The in-memory structure used to track swap areas.
  */
@@ -184,6 +220,12 @@ struct swap_info_struct {
 	signed char	next;		/* next type on the swap list */
 	unsigned int	max;		/* extent of the swap_map */
 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+#ifdef CONFIG_MEMSWAP
+	unsigned int *slot_map;         /* nvm-swap */
+	unsigned int *slot_age;         /* nvm-swap */
+	unsigned int *index;            /* nvm-swap */
+	unsigned int *whoami;           /* nvm-swap */
+#endif
 	unsigned int lowest_bit;	/* index of first free in swap_map */
 	unsigned int highest_bit;	/* index of last free in swap_map */
 	unsigned int pages;		/* total of usable pages of swap */
@@ -192,11 +234,20 @@ struct swap_info_struct {
 	unsigned int cluster_nr;	/* countdown to next cluster search */
 	unsigned int lowest_alloc;	/* while preparing discard cluster */
 	unsigned int highest_alloc;	/* while preparing discard cluster */
+#ifdef CONFIG_MEMSWAP
+	struct swap_slot_age_struct *heap; /* nvm-swap */
+	struct trie_struct *trie_root;     /* nvm-swap */
+	struct list_struct *free_list;     /* nvm-swap */
+	struct list_struct *used_list;     /* nvm-swap */
+#endif
 	struct swap_extent *curr_swap_extent;
 	struct swap_extent first_swap_extent;
 	struct block_device *bdev;	/* swap device or bdev of swap file */
 	struct file *swap_file;		/* seldom referenced */
 	unsigned int old_block_size;	/* seldom referenced */
+#ifdef CONFIG_MEMSWAP
+	unsigned long start_pfn;        /* nvm-swap */
+#endif
 };
 
 struct swap_list_t {
@@ -354,6 +405,24 @@ extern sector_t swapdev_block(int, pgoff_t);
 extern int reuse_swap_page(struct page *);
 extern int try_to_free_swap(struct page *);
 struct backing_dev_info;
+
+#ifdef CONFIG_MEMSWAP
+/* nvm-swap */
+extern struct page *alloc_mem_swap_page(void);
+extern struct swap_info_struct *mem_swap_page2info(struct page*);
+extern struct swap_info_struct *mem_swap_entry2info(swp_entry_t);
+extern struct swap_info_struct *mem_swap_type2info(int);
+extern unsigned long mem_swap_start_pfn(void);
+extern unsigned long mem_swap_end_pfn(void);
+extern unsigned int is_mem_swap_page(struct page *pg);
+extern unsigned long mem_swap_nr_free_pages(void);
+extern int free_mem_swap_page(struct page *page);
+extern int mem_swap_type(void);
+extern void min_heapify(struct swap_slot_age_struct*,
+			unsigned int *, int, int);
+extern atomic_t *get_lock_flag(void);
+extern spinlock_t *get_spin_lock(void);
+#endif
 
 /* linux/mm/thrash.c */
 extern struct mm_struct *swap_token_mm;

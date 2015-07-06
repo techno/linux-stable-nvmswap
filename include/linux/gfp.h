@@ -37,6 +37,7 @@ struct vm_area_struct;
 #define ___GFP_NO_KSWAPD	0x400000u
 #define ___GFP_OTHER_NODE	0x800000u
 #define ___GFP_WRITE		0x1000000u
+#define ___GFP_MEMSWAP          0x2000000u
 
 /*
  * GFP bitmasks..
@@ -51,7 +52,12 @@ struct vm_area_struct;
 #define __GFP_HIGHMEM	((__force gfp_t)___GFP_HIGHMEM)
 #define __GFP_DMA32	((__force gfp_t)___GFP_DMA32)
 #define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
+#define __GFP_MEMSWAP   ((__force gfp_t)___GFP_MEMSWAP)
+#ifdef CONFIG_ZONE_MEMSWAP
+#define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE|__GFP_MEMSWAP)
+#else
 #define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+#endif
 /*
  * Action modifiers - doesn't change the zoning
  *
@@ -94,7 +100,11 @@ struct vm_area_struct;
  */
 #define __GFP_NOTRACK_FALSE_POSITIVE (__GFP_NOTRACK)
 
+#ifdef CONFIG_MEMSWAP
+#define __GFP_BITS_SHIFT 26	/* Room for N __GFP_FOO bits */
+#else
 #define __GFP_BITS_SHIFT 25	/* Room for N __GFP_FOO bits */
+#endif
 #define __GFP_BITS_MASK ((__force gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
 
 /* This equals 0, but use constants in case they ever change */
@@ -147,6 +157,9 @@ struct vm_area_struct;
 
 /* 4GB DMA on some platforms */
 #define GFP_DMA32	__GFP_DMA32
+
+#define GFP_SWAP        __GFP_SWAP
+#define GFP_MEMSWAP	__GFP_MEMSWAP
 
 /* Convert GFP flags to their corresponding migrate type */
 static inline int allocflags_to_migratetype(gfp_t gfp_flags)

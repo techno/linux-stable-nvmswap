@@ -37,6 +37,16 @@
 #include <linux/swapops.h>
 #include <linux/page_cgroup.h>
 
+#include <linux/timex.h>
+#include <linux/timer.h>
+#include <linux/time.h>
+#include <linux/jiffies.h>
+#include <linux/mmzone.h>
+#include <linux/pfn.h>
+#include <linux/page-flags.h>
+#include <linux/fs.h>
+#include <asm/segment.h>
+
 static bool swap_count_continued(struct swap_info_struct *, pgoff_t,
 				 unsigned char);
 static void free_swap_count_continuations(struct swap_info_struct *);
@@ -47,6 +57,21 @@ static unsigned int nr_swapfiles;
 long nr_swap_pages;
 long total_swap_pages;
 static int least_priority;
+
+/*
+ * nvm-swap
+ */
+static int flags = 0;
+static int w_cnt = 0;
+static int w_cntp = 0;
+static int r_cnt = 0;
+static int w_time = 0;
+static int w_timep = 0;
+static int r_time = 0;
+static int mem_swap_index;
+static struct page *test_page;
+static struct swap_info_struct *sp;
+static int cnt = 0;
 
 static const char Bad_file[] = "Bad swap file entry ";
 static const char Unused_file[] = "Unused swap file entry ";
@@ -179,6 +204,246 @@ static int wait_for_discard(void *word)
 #define SWAPFILE_CLUSTER	256
 #define LATENCY_LIMIT		256
 
+#ifdef CONFIG_MEMSWAP
+void trie_insert(int n, struct trie_struct *tr)
+{
+    int k;
+    tr->num++;
+    if (n == 0)
+        return;
+    k = n % 10;
+    tr->subnum -= tr->next[k]->num;
+    trie_insert(n/10, tr->next[k]);
+    tr->subnum += tr->next[k]->num;
+}
+
+int trie_delete(int n, struct trie_struct *tr)
+{
+    int k = n % 10;
+    if (n == 0) {
+        if (tr->num == tr->subnum)
+            return 0;
+        tr->num--;
+        return 1;
+    }
+    if (tr->next[k]->num == 0)
+        return 0;
+    tr->subnum -= tr->next[k]->num;
+
+    if (trie_delete(n / 10, tr->next[k])) {
+        tr->num--;
+        tr->subnum += tr->next[k]->num;
+        return 1;
+    } else {
+        tr->subnum += tr->next[k]->num;
+        return 0;
+    }
+}
+
+int trie_get(struct trie_struct *tr)
+{
+    int i;
+    for (i = 0; i < 10; i++) {
+        if (tr->next[i] != NULL && tr->next[i]->num != 0)
+          return i + 10 * trie_get(tr->next[i]);
+    }
+
+    return 0;
+}
+
+
+/*
+ * Find an unuse map slot, the map slot is returned to application,
+ * the actually swap slot can be found by the swap slot mapping table.
+ */
+#ifdef MEM_SWAP_LIST
+unsigned long mem_swap_get_map_slot(struct swap_info_struct *si,
+            unsigned long offset)
+{
+    unsigned long free;
+    list_node_t *p = si->free_list->head;
+    if (!head)
+        return 0;
+
+    free = p->offset;
+    if (!p->next) {
+        si->free_list->head = NULL;
+        si->free_list->tail = NULL;
+    } else
+        si->free_list->head = p->next;
+
+    if (!si->used_list->head) {
+        si->used_list->head = p;
+        si->used_list->tail = p;
+    } else {
+        si->used_list->tail->next = p;
+        si->used_list->tail = p;
+    }
+
+    return free;
+
+}
+
+int mem_swap_free_map_slot(struct swap_info_struct *si,
+            unsigned long offset)
+{
+    list_node_t *p;
+
+    if (!si->used_list->head)
+        return -1;
+
+    p = si->used_list->head;
+    if (p->next == NULL) {
+        si->used_list->head = NULL;
+        si->used_list->tail = NULL;
+    } else
+        si->used_list->head = p->next;
+
+    if (!si->free_list->head) {
+        si->free_list->head = p;
+        si->free_list->tail = p;
+    } else {
+        si->free_list->tail->next = p;
+        si->free_list->tail = p;
+    }
+
+    p->offset = offset;
+
+    return 0;
+
+}
+
+#else
+unsigned long mem_swap_get_map_slot(struct swap_info_struct *si,
+            unsigned long offset)
+{
+    unsigned long free;
+
+    if (si->slot_map[offset] == offset) {
+        trie_delete(offset, si->trie_root);
+        return offset;
+    } else {
+        free = trie_get(si->trie_root);
+        if (free != 0)
+            trie_delete(free, si->trie_root);
+        return free;
+    }
+}
+#endif
+
+int inline need_wear_leveling(struct swap_info_struct *si,
+            unsigned long offset)
+{
+    //return ((si->slot_age[offset] - *(si->heap[0].age)) > 16);
+    return 0;
+}
+
+unsigned long mem_swap_wear_leveling(struct swap_info_struct *si,
+            unsigned long offset, unsigned char usage)
+{
+    unsigned long top = si->heap[0].offset;
+    unsigned long *addr1, *addr2;
+    unsigned long pre, next;
+    unsigned long free;
+
+    flags = 1;
+
+    if (si->swap_map[top]) {
+        /* remove offset from free list */
+        addr1 = __va(si->cluster_nr << PAGE_SHIFT);
+        si->cluster_nr = *(addr1 + PAGE_SIZE/sizeof(unsigned long) - 1);
+        si->inuse_pages++;
+
+        /* copy the data in top pfn to offset pfn */
+        addr1 = __va((si->start_pfn + top) << PAGE_SHIFT);
+        addr2 = __va((si->start_pfn + offset) << PAGE_SHIFT);
+        memcpy((void*)addr2, (void*)addr1, PAGE_SIZE);
+        si->slot_age[offset]++;
+
+        free = offset;
+        while (si->slot_map[free] != free)
+            free = si->slot_map[free];
+
+        si->slot_map[si->whoami[top]] = offset;
+        si->slot_map[free] = top;
+
+        si->swap_map[offset] = si->swap_map[top];
+        si->swap_map[top] = usage;
+
+        si->whoami[offset] = si->whoami[top];
+        si->whoami[top] = free;
+
+        min_heapify(si->heap, si->index, si->max, si->index[offset]);
+
+        return free;
+
+    } else {
+        /* remove top from free list */
+        addr1 = __va((si->start_pfn + top) << PAGE_SHIFT);
+        pre = *addr1;
+        next = *(addr1 + PAGE_SIZE/sizeof(unsigned long) - 1);
+
+        if (pre) {
+            addr1 = __va(pre << PAGE_SHIFT);
+            addr1 = addr1 + PAGE_SIZE/sizeof(unsigned long) - 1;
+            *addr1 = next;
+        } else
+            printk(KERN_ERR "MemSwap[error]: top = %lu, offset = %lu\n", top, offset);
+
+        if (next) {
+            addr1 = __va(next << PAGE_SHIFT);
+            *addr1 = pre;
+        } else
+            si->cluster_next = pre;
+
+        si->inuse_pages++;
+        si->swap_map[top] = usage;
+
+        free = top;
+        while (si->slot_map[free] != free)
+            free = si->slot_map[free];
+
+        si->slot_map[free] = top;
+        si->whoami[top] = free;
+        return free;
+
+    }
+}
+
+static unsigned long scan_mem_swap_map(struct swap_info_struct *si,
+            unsigned char usage)
+{
+    unsigned long offset;
+    unsigned long *addr;
+    unsigned long free;
+
+    if (si->cluster_nr) {
+        offset = si->cluster_nr - si->start_pfn;
+
+        /* need to do wear-leveling */
+        if (need_wear_leveling(si, offset)) {
+            return mem_swap_wear_leveling(si, offset, usage);
+        } else {
+            addr = __va(si->cluster_nr << PAGE_SHIFT);
+            si->cluster_nr = *(addr + PAGE_SIZE/sizeof(unsigned long) - 1);
+            si->swap_map[offset] = usage;
+            si->inuse_pages++;
+
+            free = offset;
+            while (si->slot_map[free] != free)
+                free = si->slot_map[free];
+
+            si->slot_map[free] = offset;
+            si->whoami[offset] = free;
+            return free;
+        }
+    }
+    else {
+        return 0;
+    }
+}
+#endif
+
 static unsigned long scan_swap_map(struct swap_info_struct *si,
 				   unsigned char usage)
 {
@@ -187,6 +452,12 @@ static unsigned long scan_swap_map(struct swap_info_struct *si,
 	unsigned long last_in_cluster = 0;
 	int latency_ration = LATENCY_LIMIT;
 	int found_free_cluster = 0;
+
+#ifdef CONFIG_MEMSWAP
+	/* mem swap area */
+	if (si->flags & SWP_MEM)
+		return scan_mem_swap_map(si, usage);
+#endif
 
 	/*
 	 * We try to cluster swap pages by allocating them sequentially
@@ -450,6 +721,36 @@ noswap:
 	return (swp_entry_t) {0};
 }
 
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+struct page *alloc_mem_swap_page()
+{
+	struct swap_info_struct *si;
+	unsigned long pfn = 0, offset = 0;
+
+	spin_lock(&swap_lock);
+	if (nr_swap_pages <= 0)
+		goto noswap;
+	nr_swap_pages--;
+
+	si = swap_info[mem_swap_index];
+	if (si != NULL) {
+		offset = scan_swap_map(si, 1);
+		if (offset) {
+			pfn = offset + mem_swap_start_pfn();
+			spin_unlock(&swap_lock);
+			return pfn_to_page(pfn);
+		}
+	}
+
+noswap:
+	spin_unlock(&swap_lock);
+	return NULL;
+}
+#endif
+
 /* The only caller of this function is now susupend routine */
 swp_entry_t get_swap_page_of_type(int type)
 {
@@ -486,6 +787,9 @@ static struct swap_info_struct *swap_info_get(swp_entry_t entry)
 	if (!(p->flags & SWP_USED))
 		goto bad_device;
 	offset = swp_offset(entry);
+#ifdef CONFIG_MEMSWAP
+	offset = p->slot_map[offset]; /* ???: nvm-swap */
+#endif
 	if (offset >= p->max)
 		goto bad_offset;
 	if (!p->swap_map[offset])
@@ -508,12 +812,131 @@ out:
 	return NULL;
 }
 
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+static unsigned char mem_swap_entry_free(struct swap_info_struct *p,
+					 swp_entry_t entry, unsigned char usage)
+{
+	unsigned long old = swp_offset(entry);
+	unsigned long offset;
+	unsigned char count;
+	unsigned char has_cache;
+	unsigned long *addr;
+
+	offset = p->slot_map[old];
+
+	/* update the mapping layer */
+	p->slot_map[old] = old;
+	p->whoami[offset] = offset;
+	//trie_insert(old, p->trie_root);
+
+
+	count = p->swap_map[offset];
+	has_cache = count & SWAP_HAS_CACHE;
+	count &= ~SWAP_HAS_CACHE;
+
+	/*
+	  sprintf(buf, "old = %lu\toffset = %lu\tcount = %d\n", old, offset, count);
+	  old_ds = get_fs();
+	  set_fs(KERNEL_DS);
+	  fp->f_op->write(fp, buf, strlen(buf), &(fp->f_pos));
+	  set_fs(old_ds);
+	*/
+
+	if (usage == SWAP_HAS_CACHE) {
+		VM_BUG_ON(!has_cache);
+		has_cache = 0;
+	} else if (count == SWAP_MAP_SHMEM) {
+		/*
+		 * Or we could insist on shmem.c using a special
+		 * swap_shmem_free() and free_shmem_swap_and_cache()...
+		 */
+		count = 0;
+	} else if ((count & ~COUNT_CONTINUED) <= SWAP_MAP_MAX) {
+		if (count == COUNT_CONTINUED) {
+			if (swap_count_continued(p, offset, count))
+				count = SWAP_MAP_MAX | COUNT_CONTINUED;
+			else
+				count = SWAP_MAP_MAX;
+		} else
+			count--;
+	}
+
+	if (!count)
+		mem_cgroup_uncharge_swap(entry);
+
+	usage = count | has_cache;
+	p->swap_map[offset] = usage;
+
+	/* free if no reference */
+	if (!usage) {
+		p->inuse_pages--;
+		nr_swap_pages++;
+		if (p->cluster_nr == 0) {
+			p->cluster_next = offset + p->start_pfn;
+			p->cluster_nr = offset + p->start_pfn;
+			addr = __va(p->cluster_nr << PAGE_SHIFT);
+			memset(addr, 0, PAGE_SIZE);
+		}
+		else {
+			addr = __va(p->cluster_next << PAGE_SHIFT);
+			addr = addr + PAGE_SIZE / sizeof(unsigned long) - 1;
+			*addr  = offset + p->start_pfn;
+			addr = __va((offset + p->start_pfn) << PAGE_SHIFT);
+			memset(addr, 0, PAGE_SIZE);
+			*addr = p->cluster_next;
+			p->cluster_next = offset + p->start_pfn;
+		}
+	}
+
+	return usage;
+}
+
+int free_mem_swap_page(struct page *page)
+{
+	struct swap_info_struct *si;
+	unsigned long pfn, start_pfn, end_pfn;
+	swp_entry_t entry;
+	unsigned long offset;
+	unsigned char ret;
+
+	spin_lock(&swap_lock);
+	si = swap_info[mem_swap_index];
+	pfn = page_to_pfn(page);
+	start_pfn = mem_swap_start_pfn();
+	end_pfn = mem_swap_end_pfn();
+	if (pfn < start_pfn || pfn > end_pfn) {
+		printk(KERN_ERR"MEM_SWAP[error]: try to free a non-swap page!\n");
+		spin_unlock(&swap_lock);
+		return -1;
+	}
+
+	offset = pfn - start_pfn;
+	entry = swp_entry(mem_swap_index, offset);
+
+	ret = mem_swap_entry_free(si, entry, 1);
+	spin_unlock(&swap_lock);
+
+	if (ret)
+		return -1;
+	else
+		return 0;
+}
+#endif
+
 static unsigned char swap_entry_free(struct swap_info_struct *p,
 				     swp_entry_t entry, unsigned char usage)
 {
 	unsigned long offset = swp_offset(entry);
 	unsigned char count;
 	unsigned char has_cache;
+
+#ifdef CONFIG_MEMSWAP
+	if (p->flags & SWP_MEM)
+		return mem_swap_entry_free(p, entry, usage);
+#endif
 
 	count = p->swap_map[offset];
 	has_cache = count & SWAP_HAS_CACHE;
@@ -610,7 +1033,11 @@ static inline int page_swapcount(struct page *page)
 	entry.val = page_private(page);
 	p = swap_info_get(entry);
 	if (p) {
+#ifdef CONFIG_MEMSWAP
+		count = swap_count(p->swap_map[p->slot_map[swp_offset(entry)]]);
+#else
 		count = swap_count(p->swap_map[swp_offset(entry)]);
+#endif
 		spin_unlock(&swap_lock);
 	}
 	return count;
@@ -739,7 +1166,11 @@ int mem_cgroup_count_swap_user(swp_entry_t ent, struct page **pagep)
 		count += page_mapcount(page);
 	p = swap_info_get(ent);
 	if (p) {
+#ifdef CONFIG_MEMSWAP
+		count = swap_count(p->swap_map[p->slot_map[swp_offset(ent)]]);
+#else
 		count += swap_count(p->swap_map[swp_offset(ent)]);
+#endif
 		spin_unlock(&swap_lock);
 	}
 
@@ -1066,7 +1497,7 @@ static int try_to_unuse(unsigned int type)
 	unsigned char swcount;
 	struct page *page;
 	swp_entry_t entry;
-	unsigned int i = 0;
+	unsigned int i = 0, pre = 0;
 	int retval = 0;
 
 	/*
@@ -1091,7 +1522,11 @@ static int try_to_unuse(unsigned int type)
 	 * one pass through swap_map is enough, but not necessarily:
 	 * there are races when an instance of an entry might be missed.
 	 */
+#ifdef CONFIG_MEMSWAP
+	while ((i = find_next_to_unuse(si, pre)) != 0) {
+#else
 	while ((i = find_next_to_unuse(si, i)) != 0) {
+#endif
 		if (signal_pending(current)) {
 			retval = -EINTR;
 			break;
@@ -1102,7 +1537,14 @@ static int try_to_unuse(unsigned int type)
 		 * cache page if there is one.  Otherwise, get a clean
 		 * page and read the swap into it.
 		 */
+#ifdef CONFIG_MEMSWAP
+		pre = i;
+		i = si->whoami[i];
+		swap_map = &si->swap_map[pre];
+#else
 		swap_map = &si->swap_map[i];
+#endif
+
 		entry = swp_entry(type, i);
 		page = read_swap_cache_async(entry,
 					GFP_HIGHUSER_MOVABLE, NULL, 0);
@@ -1327,6 +1769,69 @@ sector_t map_swap_page(struct page *page, struct block_device **bdev)
 	entry.val = page_private(page);
 	return map_swap_entry(entry, bdev);
 }
+
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+struct swap_info_struct *mem_swap_page2info(struct page *page)
+{
+	swp_entry_t entry;
+	entry.val = page_private(page);
+	return swap_info[swp_type(entry)];
+}
+
+inline struct swap_info_struct *mem_swap_entry2info(swp_entry_t entry)
+{
+	return swap_info[swp_type(entry)];
+}
+
+inline struct swap_info_struct *mem_swap_type2info(int type)
+{
+	return swap_info[type];
+}
+
+inline unsigned long mem_swap_start_pfn(void)
+{
+	return swap_info[mem_swap_index]->start_pfn;
+}
+
+inline unsigned long mem_swap_end_pfn(void)
+{
+	return swap_info[mem_swap_index]->start_pfn +
+		swap_info[mem_swap_index]->max;
+}
+
+unsigned int is_mem_swap_page(struct page *pg)
+{
+	unsigned long pfn;
+	struct swap_info_struct *si;
+
+	si = swap_info[mem_swap_index];
+
+	//return 0;
+
+	if (si && (si->flags & SWP_MEM)) {
+		pfn = page_to_pfn(pg);
+		if (pfn >= mem_swap_start_pfn() && pfn <= mem_swap_end_pfn())
+			return 1;
+		else
+			return 0;
+	}
+	else
+		return 0;
+}
+
+inline unsigned long mem_swap_nr_free_pages()
+{
+	return nr_swap_pages;
+}
+
+inline int mem_swap_type()
+{
+	return mem_swap_index;
+}
+#endif
 
 /*
  * Free all of a swapdev's extent information
@@ -1751,11 +2256,27 @@ static int swap_show(struct seq_file *swap, void *v)
 	struct swap_info_struct *si = v;
 	struct file *file;
 	int len;
+	int i;
 
 	if (si == SEQ_START_TOKEN) {
 		seq_puts(swap,"Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n");
 		return 0;
 	}
+
+#ifdef CONFIG_MEMSWAP
+	for(i = 0; i < si->max; i++) {
+		if (si->swap_map[i] != SWAP_MAP_BAD)
+			seq_printf(swap, "%d\n", si->slot_age[i]);
+	}
+
+	if (si->flags & SWP_MEM) {
+		seq_printf(swap, "ZONE_MEMSWAP\t\t\t\tMemSwap \t%u\t%u\t%d\n",
+			   si->pages << (PAGE_SHIFT - 10),
+			   si->inuse_pages << (PAGE_SHIFT - 10),
+			   si->prio);
+		return 0;
+	}
+#endif
 
 	file = si->swap_file;
 	len = seq_path(swap, &file->f_path, " \t\n\\");
@@ -2001,6 +2522,391 @@ static int setup_swap_map_and_extents(struct swap_info_struct *p,
 	return nr_extents;
 }
 
+#ifdef CONFIG_MEMSWAP
+/*
+ * nvm-swap
+ */
+int setup_mem_swap_map(struct swap_info_struct *p,
+		       unsigned char *swap_map, unsigned long maxpages)
+{
+	unsigned long nr_good_pages = maxpages - 1;
+	unsigned long nr_badpages = 1;
+	unsigned long start = p->start_pfn;
+	unsigned long end = start + maxpages;
+	unsigned long pfn = 0;
+	struct page *pg;
+
+	if (nr_good_pages) {
+		swap_map[0] = SWAP_MAP_BAD;
+		p->max = maxpages;
+
+		for (pfn = start + 1; pfn < end; pfn++) {
+			pg = pfn_to_page(pfn);
+			if(page_count(pg)) {
+				swap_map[pfn - start] = SWAP_MAP_BAD;
+				nr_good_pages--;
+				nr_badpages++;
+				printk(KERN_INFO "MemSwap: bad pfn = %lu\n", pfn);
+			}
+		}
+		p->pages = nr_good_pages;
+		printk(KERN_INFO "MemSwap: %lu good pages, %lu bad pages\n",
+		       nr_good_pages, nr_badpages);
+		return 0;
+	}
+	else
+		return -EINVAL;
+}
+
+unsigned long setup_mem_swap_header(struct swap_info_struct *p, struct zone *zone)
+{
+	unsigned long zonepages, maxpages;
+	unsigned long start_pfn;
+	union swap_header *swap_header;
+	struct page *header_page = NULL;
+
+	zonepages = zone->spanned_pages;
+
+	if (zonepages <= 0) {
+		printk(KERN_ERR "Memswap: empty swap zone: MemSwap\n");
+		return 0;
+	}
+	else
+		printk(KERN_INFO "MemSwap: swap size = %lu pages\n", zonepages);
+
+	start_pfn = zone->zone_start_pfn;
+	p->start_pfn = start_pfn;
+	header_page = pfn_to_page(start_pfn);
+
+	swap_header  = (union swap_header*)page_address(header_page);
+
+	/*
+	  memcpy(swap_header->magic.magic, "SWAPSPACE2", 10);
+	  swap_header->info.version = 1;
+	  swap_header->info.last_page = zonepages;
+	  swap_header->info.nr_badpages=0;
+	  memcpy(swap_header->info.sws_volume, "MemSwap\0",8);
+	*/
+
+	p->lowest_bit = 1;
+	p->cluster_next = 1;
+	p->cluster_nr = 0;
+
+	maxpages = swp_offset(pte_to_swp_entry(
+				      swp_entry_to_pte(swp_entry(0, ~0UL))));
+	maxpages = swp_offset(radix_to_swp_entry(
+				      swp_to_radix_entry(swp_entry(0, maxpages)))) + 1;
+
+	if (maxpages > zonepages)
+		maxpages = zonepages;
+
+	p->highest_bit = maxpages - 1;
+
+	return maxpages;
+}
+
+int mem_swap_free_list_init(struct swap_info_struct *p)
+{
+	unsigned long start = p->start_pfn;
+	unsigned long end = start + p->max;
+	unsigned long pfn, pre;
+	unsigned long *addr = NULL;
+	int size = PAGE_SIZE / sizeof(unsigned long);
+
+
+
+	/* find the first valid pfn */
+	for (pfn = start + 1; pfn < end; pfn++) {
+		if (p->swap_map[pfn - start] != SWAP_MAP_BAD) {
+			pre = pfn;
+			addr = __va(pre << PAGE_SHIFT);
+			memset(addr, 0, PAGE_SIZE);
+			break;
+		}
+	}
+
+	if(pfn < end)
+		p->cluster_nr = pre;
+	else
+		return -1;
+
+	for (pfn++; pfn < end; pfn++) {
+		if (p->swap_map[pfn - start] == SWAP_MAP_BAD)
+			continue;
+		addr = __va(pfn << PAGE_SHIFT);
+		memset(addr, 0, PAGE_SIZE);
+		*addr = pre;
+
+		addr = __va(pre << PAGE_SHIFT);
+		*(addr +  size - 1) = pfn;
+		pre = pfn;
+	}
+
+	if(addr)
+		p->cluster_next = pre;
+	else
+		return -1;
+
+	printk(KERN_INFO "MemSwap: B = %u, E = %u\n", p->cluster_nr,
+	       p->cluster_next);
+
+	return 0;
+}
+
+int mem_swap_maping_init(struct swap_info_struct *si,
+			 unsigned int *slot_map, unsigned long maxpages)
+{
+	int i;
+	for (i = 0; i < maxpages; i++)
+		slot_map[i] = i;
+	si->slot_map = slot_map;
+	return 0;
+}
+
+#define LEFT(i)     (2*i)
+#define RIGHT(i)    (2*i + 1)
+/* 10^7 for each slot */
+#define MAX_SLOT_AGE   (10000000UL)
+
+void exchange(struct swap_slot_age_struct *a, struct swap_slot_age_struct *b)
+{
+	int offset = a->offset;
+	int *age = a->age;
+
+	a->offset = b->offset;
+	a->age = b->age;
+
+	b->offset = offset;
+	b->age = age;
+}
+
+
+void min_heapify(struct swap_slot_age_struct heap[],
+		 unsigned int index[], int heap_size, int i)
+{
+	int l = LEFT(i);
+	int r = RIGHT(i);
+	int s = 0;
+
+	if (l < heap_size && *(heap[l].age) < *(heap[i].age))
+		s = l;
+	else
+		s = i;
+	if (r < heap_size && *(heap[r].age) < *(heap[s].age))
+		s = r;
+
+	if (s != i) {
+		index[heap[i].offset] = s;
+		index[heap[s].offset] = i;
+		exchange(&heap[i], &heap[s]);
+		min_heapify(heap, index, heap_size, s);
+	}
+}
+
+void build_min_heap(struct swap_slot_age_struct heap[],
+		    unsigned int index[], int heap_size)
+{
+	int i;
+	for (i = heap_size/2; i >= 0; i--)
+		min_heapify(heap, index, heap_size, i);
+}
+
+int mem_swap_heap_init(struct swap_info_struct *si,
+		       struct swap_slot_age_struct heap[],
+		       unsigned int slot_age[], unsigned int index[],
+		       unsigned long maxpages)
+{
+	int i;
+	for (i = 0; i < maxpages; i++) {
+		heap[i].offset = i;
+		if (si->swap_map[i] == SWAP_MAP_BAD)
+			slot_age[i] = MAX_SLOT_AGE;
+		else
+			slot_age[i] = i % 100;
+		heap[i].age = &slot_age[i];
+		index[i] = i;
+	}
+
+	build_min_heap(heap, index, maxpages);
+	si->heap = heap;
+	si->slot_age = slot_age;
+	si->index = index;
+	return 0;
+}
+
+int mem_swap_whoami(struct swap_info_struct *si, unsigned int *whoami,
+		    unsigned long maxpages)
+{
+	int i;
+	for (i = 0; i < maxpages; i++)
+		whoami[i] = i;
+	si->whoami = whoami;
+	return 0;
+}
+
+void trie_build(int n, int *res, struct trie_struct *tr)
+{
+	int i;
+	struct trie_struct *node = NULL;
+
+	if (n == 0)
+		return;
+	for (i = 0; i < 10; i++) {
+		cnt++;
+		node = (struct trie_struct*)vzalloc(sizeof(struct trie_struct));
+		if (!node) {
+			printk(KERN_ERR "MemSwap: no memory!\n");
+			*res = -ENOMEM;
+			return;
+		}
+		node->num = node->subnum = 0;
+		tr->next[i] = node;
+		trie_build(n - 1, res, tr->next[i]);
+		if ((*res) != 0)
+			return;
+	}
+}
+
+int mem_swap_trie_init(int maxpages, struct swap_info_struct *si)
+{
+	int n = 0;
+	int i;
+	int res = 0;
+	int max = maxpages;
+	struct trie_struct *root = NULL;
+	root = (struct trie_struct*)vzalloc(sizeof(struct trie_struct));
+	if (!root)
+		return -ENOMEM;
+
+	root->num = 0;
+	root->subnum = 0;
+	si->trie_root = root;
+
+	while(maxpages != 0) {
+		n++;
+		maxpages /= 10;
+	}
+
+	printk(KERN_INFO "max = %d\tn = %d\n", maxpages, n);
+
+	trie_build(n, &res, root);
+
+	printk (KERN_INFO "cnt = %d\n", cnt);
+
+	if (res == 0) {
+		for (i = 1; i < max; i++)
+			trie_insert(i, root);
+		printk(KERN_INFO "root->num = %d\n", root->num);
+		return 0;
+	} else
+		return -1;
+}
+
+int mem_swap_map_slot_list_init(struct swap_info_struct *si, int maxpages)
+{
+	list_node_t *head, *pre, *one;
+	struct list_struct *list, *used;
+	int i;
+
+	list = (struct list_struct *)vzalloc(sizeof(struct list_struct));
+	used = (struct list_struct *)vzalloc(sizeof(struct list_struct));
+	pre = head = (list_node_t*)vzalloc(sizeof(list_node_t));
+	head->offset = 1;
+	head->next = NULL;
+
+	for (i = 2; i < maxpages; i++) {
+		one = (list_node_t*)vzalloc(sizeof(list_node_t));
+		one->offset = i;
+		one->next = NULL;
+		pre->next = one;
+		pre = one;
+	}
+
+	list->head = head;
+	list->tail = pre;
+
+	used->head = NULL;
+	used->tail = NULL;
+
+	si->free_list = list;
+	si->used_list = used;
+
+	return 0;
+}
+
+int mem_swap_on(struct swap_info_struct *p, int swap_flags)
+{
+	int error = 0;
+	int prio;
+	unsigned long maxpages = 0;
+	struct zone *zone;
+	unsigned char* swap_map = NULL;
+	unsigned int *slot_map = NULL;
+	unsigned int *slot_age = NULL;
+	unsigned int *index = NULL;
+	unsigned int *whoami;
+	struct swap_slot_age_struct *heap = NULL;
+	pg_data_t *pgdat = NODE_DATA(0);
+
+	zone = &pgdat->node_zones[ZONE_MEMSWAP];
+	/* set p->lowest_bit, p->cluster_next, p->cluster_nr, p->highest_bit*/
+	maxpages = setup_mem_swap_header(p, zone);
+	if(unlikely(!maxpages))
+		return -EINVAL;
+
+	swap_map = vzalloc(maxpages);
+	if (!swap_map)
+		return -ENOMEM;
+	/* set p->max, p->pages */
+	error = setup_mem_swap_map(p, swap_map, maxpages);
+	if (error != 0)
+		return error;
+
+	mutex_lock(&swapon_mutex);
+
+	prio = -1;
+	if (swap_flags & SWAP_FLAG_PREFER)
+		prio = (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
+
+	/* set p->swap_map, p->next */
+	enable_swap_info(p, prio, swap_map);
+
+	/* link the free page slot in list */
+	error = mem_swap_free_list_init(p);
+	if (error != 0)
+		return error;
+
+	/* setup the swap slot mapping */
+	slot_map = (unsigned int *)vzalloc(maxpages * sizeof(unsigned int));
+	if (!slot_map)
+		return -ENOMEM;
+	error = mem_swap_maping_init(p, slot_map, maxpages);
+
+	/* setup the swap slot age heap */
+	heap = (struct swap_slot_age_struct *)
+		vzalloc(maxpages * sizeof(struct swap_slot_age_struct));
+	slot_age = (unsigned int *)vzalloc(maxpages * sizeof(unsigned int));
+	index = (unsigned int*)vzalloc(maxpages * sizeof(unsigned int));
+	if (!heap || !slot_age || !index)
+		return -ENOMEM;
+	error = mem_swap_heap_init(p, heap, slot_age, index, maxpages);
+
+	whoami = (unsigned int*)vzalloc(maxpages * sizeof(unsigned int));
+	if (!whoami)
+		return -ENOMEM;
+	error = mem_swap_whoami(p, whoami, maxpages);
+
+
+	p->swap_file = NULL;
+	p->bdev = NULL;
+
+	mem_swap_index = p->type;
+
+	mutex_unlock(&swapon_mutex);
+	return error;
+}
+#endif
+
 SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 {
 	struct swap_info_struct *p;
@@ -2015,8 +2921,13 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	sector_t span;
 	unsigned long maxpages;
 	unsigned char *swap_map = NULL;
+	unsigned int *slot_age;
+	unsigned int *slot_map;
 	struct page *page = NULL;
 	struct inode *inode = NULL;
+
+	/* nvm-swap */
+	printk(KERN_INFO "In swapon: swap_flags = %d (%x)\n", swap_flags, swap_flags);
 
 	if (swap_flags & ~SWAP_FLAGS_VALID)
 		return -EINVAL;
@@ -2028,12 +2939,31 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 
+	mem_swap_index = p->type;
+
 	name = getname(specialfile);
 	if (IS_ERR(name)) {
 		error = PTR_ERR(name);
 		name = NULL;
 		goto bad_swap;
 	}
+
+#ifdef CONFIG_MEMSWAP
+	/*
+	 * Check the swap_flag to see if it's a memory interface swap area
+	 */
+	if (swap_flags & SWAP_FLAG_MEM_SWAP) {
+		printk(KERN_INFO "MemSwap: try to swapon the memory interface swap area...\n");
+		p->flags |= SWP_MEM;
+		error = mem_swap_on(p, swap_flags);
+		if (!error)
+			printk(KERN_INFO "MemSwap: swap on OK!\n");
+		else
+			printk(KERN_INFO "MemSwap: swap on FAILED!\n");
+		return error;
+	}
+#endif
+
 	swap_file = filp_open(name, O_RDWR|O_LARGEFILE, 0);
 	if (IS_ERR(swap_file)) {
 		error = PTR_ERR(swap_file);
@@ -2087,6 +3017,25 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		error = -ENOMEM;
 		goto bad_swap;
 	}
+
+#ifdef CONFIG_MEMSWAP
+	/* set up the age counter of each slot */
+	slot_age = (unsigned int*)vzalloc(maxpages * sizeof(unsigned int));
+	if (!slot_age) {
+		error = -ENOENT;
+		goto bad_swap;
+	}
+
+	p->slot_age = slot_age;
+
+	/* setup the swap slot mapping */
+	slot_map = (unsigned int *)vzalloc(maxpages * sizeof(unsigned int));
+	if (!slot_map)
+		return -ENOMEM;
+	error = mem_swap_maping_init(p, slot_map, maxpages);
+	if (error)
+		return -ENOMEM;
+#endif
 
 	error = swap_cgroup_swapon(p->type, maxpages);
 	if (error)
@@ -2205,6 +3154,9 @@ static int __swap_duplicate(swp_entry_t entry, unsigned char usage)
 		goto bad_file;
 	p = swap_info[type];
 	offset = swp_offset(entry);
+#ifdef CONFIG_MEMSWAP
+	offset = p->slot_map[offset]; /* nvm-swap: ??? */
+#endif
 
 	spin_lock(&swap_lock);
 	if (unlikely(offset >= p->max))
@@ -2329,6 +3281,9 @@ int add_swap_count_continuation(swp_entry_t entry, gfp_t gfp_mask)
 	}
 
 	offset = swp_offset(entry);
+#ifdef CONFIG_MEMSWAP
+	offset = si->slot_map[offset]; /* nvm-swap: ??? */
+#endif
 	count = si->swap_map[offset] & ~SWAP_HAS_CACHE;
 
 	if ((count & ~COUNT_CONTINUED) != SWAP_MAP_MAX) {
@@ -2502,4 +3457,164 @@ static void free_swap_count_continuations(struct swap_info_struct *si)
 			}
 		}
 	}
+}
+
+/*
+ * nvm-swap
+ */
+int timeval_diff(struct timeval* result, struct timeval *x, struct timeval *y)
+{
+	if (x->tv_sec > y->tv_sec)
+		return -1;
+
+	if ((x->tv_sec == y->tv_sec) && (x->tv_usec > y->tv_usec))
+		return -1;
+
+	result->tv_sec = (y->tv_sec - x->tv_sec);
+	result->tv_usec = (y->tv_usec - x->tv_usec);
+
+	if (result->tv_usec < 0) {
+		result->tv_sec--;
+		result->tv_usec += 1000000;
+	}
+
+	return 0;
+}
+
+
+SYSCALL_DEFINE0(test_start)
+{
+	void *addr = NULL;
+	test_page = alloc_page(__GFP_HIGHMEM);
+	sp = swap_info[mem_swap_index];
+	r_cnt = r_time = 0;
+	w_cnt = w_time = 0;
+	w_cntp = w_timep = 0;
+	if (test_page && sp) {
+		addr = kmap_atomic(test_page);
+		memset(addr, 'A', PAGE_SIZE);
+		kunmap_atomic(addr);
+		return 0;
+	} else {
+		return -ENOMEM;
+	}
+}
+
+SYSCALL_DEFINE0(swap_write)
+{
+	unsigned long offset;
+	int res;
+	struct writeback_control wbc;
+	swp_entry_t entry;
+	struct timeval start, end, diff;
+
+	/* get time */
+	do_gettimeofday(&start);
+
+	if (!sp) {
+		printk(KERN_WARNING "SwapTest: no swap area available\n");
+		return 0;
+	}
+
+	spin_lock(&swap_lock);
+
+	offset = scan_swap_map(sp, 1);
+
+	if (!offset) {
+		spin_unlock(&swap_lock);
+		goto out;
+	}
+
+	entry = swp_entry(mem_swap_index, offset);
+	test_page->private = entry.val;
+	wbc.sync_mode = WB_SYNC_ALL;
+	res = swap_writepage(test_page, &wbc);
+
+#ifdef CONFIG_MEMSWAP
+	if (!(sp->flags & SWP_MEM))
+		sp->slot_age[offset]++;
+#endif
+
+	spin_unlock(&swap_lock);
+
+	/* get end time */
+	do_gettimeofday(&end);
+
+	timeval_diff(&diff, &start, &end);
+
+	if (flags) {
+		flags = 0;
+		w_cntp++;
+		w_timep += diff.tv_usec;
+	} else {
+		w_cnt++;
+		w_time += diff.tv_usec;
+	}
+
+	if(res != 0)
+		printk(KERN_INFO "MemSwap[error]:  %d byte(s) not copyed\n", res);
+
+out:
+	return offset;
+}
+
+SYSCALL_DEFINE1(swap_read, unsigned long, offset)
+{
+	int res = 0;
+	swp_entry_t entry;
+	struct timeval start, end, diff;
+
+	if (!offset) {
+		printk(KERN_INFO "SwapTest: Invalid offset\n");
+		return -1;
+	}
+
+	spin_lock(&swap_lock);
+
+	do_gettimeofday(&start);
+
+	entry = swp_entry(mem_swap_index, offset);
+	test_page->private = entry.val;
+	res = swap_readpage(test_page);
+
+	do_gettimeofday(&end);
+
+	spin_unlock(&swap_lock);
+
+
+	timeval_diff(&diff, &start, &end);
+
+	r_cnt++;
+	r_time += diff.tv_usec;
+
+	return res;
+}
+
+SYSCALL_DEFINE1(swap_free, unsigned long, offset)
+{
+	swp_entry_t entry;
+	if (!offset) {
+		printk(KERN_INFO "Invalid offset to free\n");
+		return -1;
+	}
+	entry = swp_entry(mem_swap_index, offset);
+	return swap_entry_free(sp, entry, 1);
+}
+
+SYSCALL_DEFINE0(test_end)
+{
+	__free_pages(test_page, 0);
+	if (r_cnt)
+		printk(KERN_INFO "SwapTest: total read time = %d, count = %d, avg = %d\n",
+		       r_time, r_cnt, r_time/r_cnt);
+	if (w_cnt || w_cntp)
+		printk(KERN_INFO "SwapTest: total write time= %d, count = %d, avg = %d\n",
+		       w_time + w_timep, w_cnt + w_cntp, (w_time + w_timep)/(w_cnt + w_cntp));
+	if (w_cnt)
+		printk(KERN_INFO "\tregular write time = %d, count = %d, avg = %d\n",
+		       w_time, w_cnt, w_time/w_cnt);
+	if (w_cntp)
+		printk(KERN_INFO "\twearlevel write time = %d, count = %d, avg = %d\n",w_timep, w_cntp, w_timep/w_cntp);
+
+	return 0;
 }

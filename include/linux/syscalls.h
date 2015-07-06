@@ -858,4 +858,21 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
 				      unsigned long riovcnt,
 				      unsigned long flags);
 
+/* nvm-swap */
+asmlinkage long sys_swap_write(void);
+asmlinkage long sys_swap_read(unsigned long offset);
+asmlinkage long sys_swap_free(unsigned long offset);
+asmlinkage long sys_test_start(void);
+asmlinkage long sys_test_end(void);
+asmlinkage long sys_direct_read_start(void);
+asmlinkage long sys_direct_read_end(void);
+asmlinkage long sys_reset_migration_count(void);
+asmlinkage long sys_print_migration_count(void);
+asmlinkage long sys_reset_swap_outs(void);
+asmlinkage long sys_print_swap_outs(void);
+asmlinkage long sys_print_swap_ins(void);
+asmlinkage long sys_print_mi_queue(void);
+asmlinkage long sys_clear_fault(void);
+asmlinkage long sys_get_fault(void);
+
 #endif
