@@ -3653,10 +3653,10 @@ int handle_pte_fault(struct mm_struct *mm,
 					flags |= FAULT_FLAG_MEMSWAP_WRITE;
 					entry = swp_entry_to_pte(swp);
 
+					spin_unlock(ptl);
+
 					res = do_swap_page(mm, vma, address,
 							   pte, pmd, flags, entry);
-
-					spin_unlock(ptl);
 					//res |= FAULT_FLAG_DEBUG;
 					return res;
 				}
