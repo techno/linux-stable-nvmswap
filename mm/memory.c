@@ -1174,7 +1174,7 @@ again:
 
 				if (unlikely(!page))
 					continue;
-				if(PageAnon(page))
+				if (PageAnon(page))
 					rss[MM_ANONPAGES]--;
 				else {
 					if (pte_dirty(ptent))
@@ -1186,10 +1186,10 @@ again:
 				}
 				page_remove_rmap(page);
 
-				if(page_mapcount(page) == 0) {
-					printk(KERN_ERR "try to free a mem swap page");
+				if (page_mapcount(page) == 0) {
+					MEMSWAP_DEBUG(KERN_ERR "try to free a mem swap page");
 					free_mem_swap_page(page);
-					printk("free ok\n");
+					MEMSWAP_DEBUG("free ok\n");
 				}
 				continue;
 			}
@@ -3068,28 +3068,29 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 			offset = swp_offset(entry);
 			offset = si->slot_map[offset];
 			page = pfn_to_page(si->start_pfn + offset);
-			MEMSWAP_DEBUG(KERN_INFO "MemSwap: in do_swap_page, offset = %lu, addr = %lx\n",
+
+			MEMSWAP_DEBUG(KERN_INFO "MemSwap: in do_swap_page, offset = %lu, addr = %#lx\n",
 				      offset, (unsigned long)address);
 
 			lock_page_or_retry(page, mm, flags);
 			delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
 
-			pte = mk_pte(page, __pgprot(vma->vm_page_prot.pgprot | _PAGE_MEMSWAP));
+			pte = mk_pte(page, __pgprot(vma->vm_page_prot.pgprot | _PAGE_MEMSWAP2));
 			page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
 			flush_icache_page(vma, page);
 			set_pte_at(mm, address, page_table, pte);
+
+			MEMSWAP_DEBUG(KERN_INFO "MemSwap: in do_swap_page, pte = %#lx\n", pte_val(pte));
 
 			do_page_add_anon_rmap(page, vma, address, exclusive);
 			/* It's better to call commit-charge after rmap is established */
 			mem_cgroup_commit_charge_swapin(page, ptr);
 
 			unlock_page(page);
-
 			update_mmu_cache(vma, address, page_table);
-			pte_unmap_unlock(page_table, ptl);
 
 			ret = VM_FAULT_MINOR;
-			goto out;
+			goto unlock;
 		}
 #endif
 
@@ -3638,16 +3639,16 @@ int handle_pte_fault(struct mm_struct *mm,
 				 * nvm-swap:
 				 * swap zone page write protection fault
 				 */
-				unsigned long offset =
-					((unsigned long)pte_val(entry) >> PAGE_SHIFT)
-					- mem_swap_start_pfn();
+				unsigned long offset_pfn =
+					pte_pfn(entry) - mem_swap_start_pfn();
 
-				MEMSWAP_DEBUG(KERN_INFO "NVM-SWAP PAGE FAULT PTE %x %x\n", native_pte_val(entry), offset);
+				MEMSWAP_DEBUG(KERN_INFO "MemSwap: page fault pte = %#lx, offset_pfn = %#lx\n",
+					      pte_val(entry), offset_pfn);
 
-				if (offset < MEMSWAP_ZONE_SIZE_PFN) {
+				if (offset_pfn < MEMSWAP_ZONE_SIZE_PFN) {
 					si = mem_swap_type2info(mem_swap_type());
-					offset = si->whoami[offset];
-					swp = swp_entry(mem_swap_type(), offset);
+					offset_pfn = si->whoami[offset_pfn];
+					swp = swp_entry(mem_swap_type(), offset_pfn);
 
 					flags |= FAULT_FLAG_MEMSWAP_WRITE;
 					entry = swp_entry_to_pte(swp);
@@ -3656,12 +3657,11 @@ int handle_pte_fault(struct mm_struct *mm,
 							   pte, pmd, flags, entry);
 
 					spin_unlock(ptl);
-
 					//res |= FAULT_FLAG_DEBUG;
 					return res;
 				}
-
-				MEMSWAP_DEBUG(KERN_INFO "!NO MEM SWAP\n");
+				else
+					MEMSWAP_DEBUG(KERN_INFO "^^^^ !! NOT MemSwap PAGE !! ^^^^\n");
 			}
 #endif
 			return do_wp_page(mm, vma, address,

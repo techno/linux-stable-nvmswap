@@ -139,7 +139,7 @@ static inline unsigned long pte_pfn(pte_t pte)
 
 static inline unsigned long pte_mem_swap(pte_t pte)
 {
-	return (pte_val(pte) & _PAGE_MEMSWAP);
+	return (pte_val(pte) & _PAGE_MEMSWAP2);
 }
 
 static inline unsigned long pmd_pfn(pmd_t pmd)

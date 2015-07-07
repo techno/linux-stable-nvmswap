@@ -2604,6 +2604,7 @@ unsigned long setup_mem_swap_header(struct swap_info_struct *p, struct zone *zon
 
 	p->highest_bit = maxpages - 1;
 
+	printk(KERN_INFO "MemSwap: start_pfn: %lu, maxpages = %lu\n", start_pfn, maxpages);
 	return maxpages;
 }
 
